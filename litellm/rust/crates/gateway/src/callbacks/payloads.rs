@@ -3,7 +3,8 @@
 //! payload host in `callbacks-python/src/payload.rs`.
 //!
 //! A payload is built once per hook from the call's record, when a callback subscribed to that
-//! hook reads it, and kept built until its last reference is released. Building it at render time
+//! hook reads it, and kept built until its last reference is released. It renders in the layout
+//! of Python's `json.dumps`, so a callback reads the same bytes from either host. Building it at render time
 //! instead would mean keeping a snapshot of the whole record until a flush renders it, and the
 //! logged response's `created` and a cache hit's id would carry the flush time, where Python
 //! stamps them when the call is logged.
@@ -20,6 +21,7 @@ use std::{
 use futures_util::future::BoxFuture;
 use litellm_callbacks::{PayloadHost, PayloadRef, RenderOptions, Rendered};
 use litellm_gateway_inference::{CallType, record::CallState};
+use litellm_python_compat::json;
 use litellm_redaction::SecretRedactor;
 use litellm_router_core::Router;
 use litellm_standard_logging::StandardLoggingPayload;
@@ -57,13 +59,14 @@ impl RustPayloads {
 
     /// The payload's wire JSON, each of `options.null_keys` set to `null` as the Python host's
     /// dict copy sets it: in place when the payload logs the key, and last when it does not.
+    /// Written as `json.dumps` writes it, the way the Python host's encoder lays out the dict.
     fn rendered(&self, handle: u64, options: &RenderOptions) -> Result<Vec<u8>, String> {
         let held = self.held.lock();
         let payload = held
             .get(&handle)
             .ok_or_else(|| "the payload was already released".to_owned())?;
         if options.null_keys.is_empty() {
-            return serde_json::to_vec(payload).map_err(|error| error.to_string());
+            return json::dumps_serde(payload).map_err(|error| error.to_string());
         }
         let mut document = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         drop(held);
@@ -72,7 +75,7 @@ impl RustPayloads {
                 keys.insert(key.clone(), Value::Null);
             }
         }
-        serde_json::to_vec(&document).map_err(|error| error.to_string())
+        json::dumps_serde(&document).map_err(|error| error.to_string())
     }
 }
 
@@ -213,7 +216,7 @@ mod tests {
     }
 
     #[rstest]
-    fn a_held_payload_renders_as_its_wire_json(payload: StandardLoggingPayload) {
+    fn a_held_payload_renders_as_json_dumps_writes_its_wire_json(payload: StandardLoggingPayload) {
         let payloads = Arc::new(RustPayloads::default());
         let reference = payloads.hold(payload.clone());
         let bytes = reference
@@ -221,7 +224,32 @@ mod tests {
             .now_or_never()
             .unwrap()
             .unwrap();
-        assert_eq!(bytes, serde_json::to_vec(&payload).unwrap());
+        assert_eq!(bytes, json::dumps_serde(&payload).unwrap());
+    }
+
+    #[rstest]
+    #[case::without_null_keys(&[])]
+    #[case::with_null_keys(&["response", "not_logged"])]
+    fn a_rendered_payload_has_pythons_spacing_and_ascii_escapes(
+        payload: StandardLoggingPayload,
+        #[case] nulled: &[&str],
+    ) {
+        let payloads = Arc::new(RustPayloads::default());
+        let reference = payloads.hold(StandardLoggingPayload {
+            id: "caf\u{e9} \u{1f600}".to_owned(),
+            response_time: 1e-6,
+            ..payload
+        });
+        let options = RenderOptions {
+            null_keys: nulled.iter().map(|key| (*key).to_owned()).collect(),
+        };
+        let text =
+            String::from_utf8(reference.render(options).now_or_never().unwrap().unwrap()).unwrap();
+        assert!(
+            text.starts_with(r#"{"id": "caf\u00e9 \ud83d\ude00", "litellm_call_id": "call-1", "#)
+                && text.contains(r#""response_time": 1e-06, "#),
+            "{text}"
+        );
     }
 
     /// The keys of a rendered document, in order.
