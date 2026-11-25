@@ -22,4 +22,6 @@ pub enum Error {
     Router(#[from] litellm_router_core::Error),
     #[error(transparent)]
     Callback(#[from] crate::callbacks::Unregistrable),
+    #[error(transparent)]
+    Secrets(#[from] litellm_secrets::Error),
 }
