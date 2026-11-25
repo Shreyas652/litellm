@@ -633,7 +633,7 @@ mod tests {
                 input.fields.get::<typed::LogId>().unwrap()
             ),
             (
-                serde_json::to_vec(&built).unwrap(),
+                litellm_python_compat::json::dumps_serde(&built).unwrap(),
                 Some(&serde_json::to_value(&built).unwrap()),
                 Some("call-1".to_owned())
             )
