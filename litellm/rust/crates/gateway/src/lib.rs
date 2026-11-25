@@ -24,6 +24,7 @@ pub use callbacks::{
     model_capacity::{self, ModelCapacity},
     parallel_request_limiter::{self, KeyLimiter},
     spend_log::{SpendLog, SpendLogs},
+    standard_logging,
 };
 pub use error::Error;
 pub use gateway_requests::{Category, GatewayRequests};
