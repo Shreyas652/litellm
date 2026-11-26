@@ -11,10 +11,12 @@
 mod jwt_io;
 #[macro_use]
 mod key;
+mod affiliation;
 mod store;
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use litellm_auth_store::AliasMatch;
 use litellm_config::{Config, LitellmRole};
 use litellm_env::Lookup;
 use litellm_gateway_auth::{Auth, BearerOrXApiKey, CoreAuthenticator, SystemClock};
@@ -40,11 +42,11 @@ use serde_json::Value;
 
 pub use jwt_io::{JwtIo, client_config as jwt_client_config};
 pub use key::Key;
-pub use store::AuthStore;
+pub use store::{Affiliations, AuthStore};
 
 /// The rows the native host hands the core: a key's, and a core record for each thing a caller
-/// belongs to. The steps that would read those records still decline, so no caller this host
-/// serves holds one yet. `Infallible` is a row this host has no record for, so no identity that
+/// belongs to. A JWT's team, membership and user are read, and a caller that holds a team still
+/// goes to Python at admit. The steps that read the other records decline. `Infallible` is a row this host has no record for, so no identity that
 /// needs one exists. The end user's record is empty for a request that names none.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeRows;
@@ -98,6 +100,27 @@ fn declined<T>(step: &'static str) -> Result<T, Error> {
         "the native auth host does not serve what this request needs"
     );
     Err(Error::HostDeclined)
+}
+
+/// A read the database failed is declined, so Python answers it as it would.
+fn unless_failed<T>(
+    read: Result<T, litellm_auth_store::Error>,
+    step: &'static str,
+) -> Result<T, Error> {
+    read.or_else(|error| {
+        tracing::warn!(
+            error = %litellm_error::Report::new(&error),
+            step,
+            "the native auth host could not read what this request needs"
+        );
+        declined(step)
+    })
+}
+
+impl NativeAuthHost {
+    fn store(&self, step: &'static str) -> Result<&AuthStore, Error> {
+        self.keys.as_deref().map_or_else(|| declined(step), Ok)
+    }
 }
 
 fn keyed(key: &KeyEntry) -> Result<Option<Keyed<Key>>, Error> {
@@ -364,8 +387,30 @@ impl AuthHost for NativeAuthHost {
         declined("key_owner")
     }
 
-    async fn user(&self, _: &UserLookup<'_>) -> Result<UserRead<UserRecord>, Error> {
-        declined("user")
+    /// A user read by its id. Python links the SSO id to a row that has none, backfills its
+    /// email and falls back to the SSO id and the email on a miss, so each of those declines.
+    async fn user(&self, lookup: &UserLookup<'_>) -> Result<UserRead<UserRecord>, Error> {
+        if lookup.upsert {
+            return declined("user_id_upsert");
+        }
+        let Some(read) = self.store("user")?.user(lookup.user_id).await else {
+            return declined("user");
+        };
+        let Some(user) = unless_failed(read, "user")? else {
+            return match lookup.sso_user_id.or(lookup.user_email) {
+                Some(_) => declined("user"),
+                None => Ok(UserRead::Absent),
+            };
+        };
+        if user.sso_user_id.is_none() && lookup.sso_user_id == Some(lookup.user_id) {
+            return declined("sso_user_id");
+        }
+        if user.user_email.is_none() && lookup.user_email.is_some() {
+            return declined("user_email");
+        }
+        affiliation::user(&user)
+            .map(UserRead::Found)
+            .or_else(declined)
     }
 
     async fn resolve_user_identity(
@@ -384,24 +429,54 @@ impl AuthHost for NativeAuthHost {
         declined("key_team")
     }
 
-    async fn team(&self, _: &str, _: bool) -> Result<TeamRead<TeamRecord>, Error> {
-        declined("team")
+    /// The auth store only reads, so a team the request may create declines.
+    async fn team(&self, team_id: &str, upsert: bool) -> Result<TeamRead<TeamRecord>, Error> {
+        if upsert {
+            return declined("team_id_upsert");
+        }
+        let Some(read) = self.store("team")?.team(team_id).await else {
+            return declined("team");
+        };
+        match unless_failed(read, "team")? {
+            Some(team) => affiliation::team(&team)
+                .map(TeamRead::Found)
+                .or_else(declined),
+            None => Ok(TeamRead::Absent),
+        }
     }
 
     async fn granting_team(&self, _: &str) -> Result<TeamRead<TeamRecord>, Error> {
         declined("granting_team")
     }
 
-    async fn team_by_alias(&self, _: &str) -> Result<AliasRead<TeamRecord>, Error> {
-        declined("team_by_alias")
+    async fn team_by_alias(&self, alias: &str) -> Result<AliasRead<TeamRecord>, Error> {
+        let Some(read) = self.store("team_by_alias")?.team_by_alias(alias).await else {
+            return declined("team_by_alias");
+        };
+        match unless_failed(read, "team_by_alias")? {
+            AliasMatch::Found(team) => affiliation::team(&team)
+                .map(AliasRead::Found)
+                .or_else(declined),
+            AliasMatch::Absent => Ok(AliasRead::Absent),
+            AliasMatch::Ambiguous => Ok(AliasRead::Ambiguous),
+        }
     }
 
     async fn load_team_membership(
         &self,
-        _: &str,
-        _: &str,
+        user_id: &str,
+        team_id: &str,
     ) -> Result<Option<MembershipRecord>, Error> {
-        declined("load_team_membership")
+        let store = self.store("load_team_membership")?;
+        let Some(read) = store.team_membership(user_id, team_id).await else {
+            return declined("load_team_membership");
+        };
+        match unless_failed(read, "load_team_membership")? {
+            Some(membership) => affiliation::membership(&membership)
+                .map(Some)
+                .or_else(declined),
+            None => Ok(None),
+        }
     }
 
     async fn org(&self, _: &str) -> Result<Option<Org<OrgRecord>>, Error> {
@@ -1445,5 +1520,127 @@ mod tests {
         }));
         let entra = bearing(&gateway, &entra_token).await.err().unwrap();
         assert!(matches!(entra, Rejected::NotNative), "{entra:?}");
+    }
+
+    fn affiliated(held: &Held) -> NativeAuthHost {
+        NativeAuthHost {
+            keys: Some(Arc::new(
+                AuthStore::new(keys::memory_cache(), held.database())
+                    .with_affiliations(Affiliations::new(held.repositories())),
+            )),
+            master: None,
+            jwt_io: None,
+        }
+    }
+
+    #[rstest]
+    #[case::a_linked_user_with_its_email(Some("user-1"), Some("user@example.com"), Some(true))]
+    #[case::a_user_python_links_the_sso_id_to(None, Some("user@example.com"), None)]
+    #[case::a_user_python_backfills_the_email_of(Some("user-1"), None, None)]
+    #[tokio::test]
+    async fn a_user_is_read_natively_only_where_python_writes_nothing(
+        #[case] sso_user_id: Option<&str>,
+        #[case] user_email: Option<&str>,
+        #[case] found: Option<bool>,
+    ) {
+        let held = Held::start().await;
+        held.insert_named(
+            "LiteLLM_UserTable",
+            &json!({"user_id": "user-1", "sso_user_id": sso_user_id, "user_email": user_email}),
+        )
+        .await;
+        let lookup = UserLookup {
+            user_id: "user-1",
+            user_email: Some("user@example.com"),
+            sso_user_id: Some("user-1"),
+            upsert: false,
+            email_verified: None,
+        };
+
+        let read = affiliated(&held).user(&lookup).await;
+
+        assert_eq!(read.map(|read| read.found().is_some()).ok(), found);
+    }
+
+    #[rstest]
+    #[case::absent_with_a_sign_in_to_fall_back_on(Some("user-1"), None)]
+    #[case::absent_with_nothing_to_fall_back_on(None, Some(false))]
+    #[tokio::test]
+    async fn a_user_no_row_holds_is_absent_only_without_a_fallback(
+        #[case] sso_user_id: Option<&str>,
+        #[case] found: Option<bool>,
+    ) {
+        let held = Held::start().await;
+        let lookup = UserLookup {
+            user_id: "user-1",
+            user_email: None,
+            sso_user_id,
+            upsert: false,
+            email_verified: None,
+        };
+
+        let read = affiliated(&held).user(&lookup).await;
+
+        assert_eq!(read.map(|read| read.found().is_some()).ok(), found);
+    }
+
+    #[rstest]
+    #[case::a_plain_membership(None, Some(true))]
+    #[case::a_membership_with_a_budget(Some("budget"), None)]
+    #[tokio::test]
+    async fn a_membership_with_a_budget_is_not_native(
+        #[case] budget_id: Option<&str>,
+        #[case] found: Option<bool>,
+    ) {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+        held.insert_named("LiteLLM_UserTable", &json!({"user_id": "user-1"}))
+            .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team", "budget_id": budget_id}),
+        )
+        .await;
+
+        let read = affiliated(&held)
+            .load_team_membership("user-1", "team")
+            .await;
+
+        assert_eq!(read.map(|membership| membership.is_some()).ok(), found);
+    }
+
+    #[tokio::test]
+    async fn a_user_who_is_no_member_is_cached_as_none() {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+        let host = affiliated(&held);
+
+        let first = host.load_team_membership("user-1", "team").await;
+        held.insert_named("LiteLLM_UserTable", &json!({"user_id": "user-1"}))
+            .await;
+        held.insert_named(
+            "LiteLLM_TeamMembership",
+            &json!({"user_id": "user-1", "team_id": "team"}),
+        )
+        .await;
+        let second = host.load_team_membership("user-1", "team").await;
+
+        assert_eq!((first.ok(), second.ok()), (Some(None), Some(None)));
+    }
+
+    #[rstest]
+    #[case::read(false, Some(true))]
+    #[case::created_if_missing(true, None)]
+    #[tokio::test]
+    async fn a_team_the_request_may_create_is_not_native(
+        #[case] upsert: bool,
+        #[case] found: Option<bool>,
+    ) {
+        let held = Held::start().await;
+        held.execute(PARENTS).await;
+
+        let read = affiliated(&held).team("team", upsert).await;
+
+        assert_eq!(read.map(|read| read.found().is_some()).ok(), found);
     }
 }

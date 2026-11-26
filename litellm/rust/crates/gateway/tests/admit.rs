@@ -15,7 +15,10 @@ use axum::{
     http::Method,
 };
 use litellm_config::{Config, Environment};
-use litellm_gateway::{StoredConfig, host::auth::AuthStore};
+use litellm_gateway::{
+    StoredConfig,
+    host::auth::{Affiliations, AuthStore},
+};
 use litellm_license::Entitlements;
 use litellm_model_catalog::{CostMap, IntegrityLimits};
 use litellm_repositories::StoredObjects;
@@ -28,6 +31,9 @@ struct Scenario {
     /// The virtual keys the database holds, each token with its model list.
     #[serde(default)]
     keys: BTreeMap<String, Vec<String>>,
+    /// The teams the database holds, each id with the columns set on its row.
+    #[serde(default)]
+    teams: BTreeMap<String, Columns>,
     /// The `tpm_limit` of each key that holds one.
     #[serde(default)]
     tpm_limits: BTreeMap<String, i64>,
@@ -106,14 +112,24 @@ fn stored_config(stored: Stored, held: Held) -> StoredConfig {
 
 /// The database holding each key of the scenario, a plain row with the model list and the token
 /// limit it gives.
+type Columns = serde_json::Map<String, serde_json::Value>;
+
 async fn listed(
     keys: &BTreeMap<String, Vec<String>>,
     tpm_limits: &BTreeMap<String, i64>,
+    teams: &BTreeMap<String, Columns>,
 ) -> keys::Held {
     let held = keys::Held::start().await;
     for (token, models) in keys {
         let columns = serde_json::json!({"models": models, "tpm_limit": tpm_limits.get(token)});
         held.key(token, columns).await;
+    }
+    for (team_id, columns) in teams {
+        let row = std::iter::once(("team_id".to_owned(), serde_json::json!(team_id)))
+            .chain(columns.clone())
+            .collect();
+        held.insert_named("LiteLLM_TeamTable", &serde_json::Value::Object(row))
+            .await;
     }
     held
 }
@@ -239,6 +255,8 @@ impl Sent {
 #[case::jwt_without_enterprise("jwt_without_enterprise")]
 #[case::jwt_beside_keys("jwt_beside_keys")]
 #[case::jwt_scope_based_access("jwt_scope_based_access")]
+#[case::jwt_team_header("jwt_team_header")]
+#[case::jwt_team_alias("jwt_team_alias")]
 #[tokio::test(flavor = "multi_thread")]
 async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
     litellm_gateway::install_crypto_provider();
@@ -260,17 +278,17 @@ async fn admit_answers_each_request_as_its_scenario_says(#[case] name: &str) {
             ..state
         },
     };
-    let held = match scenario.keys.is_empty() {
+    let held = match scenario.keys.is_empty() && scenario.teams.is_empty() {
         true => None,
-        false => Some(listed(&scenario.keys, &scenario.tpm_limits).await),
+        false => Some(listed(&scenario.keys, &scenario.tpm_limits, &scenario.teams).await),
     };
     let state = match &held {
         None => state,
         Some(held) => litellm_gateway::AppState {
-            keys: Some(Arc::new(AuthStore::new(
-                keys::memory_cache(),
-                held.database(),
-            ))),
+            keys: Some(Arc::new(
+                AuthStore::new(keys::memory_cache(), held.database())
+                    .with_affiliations(Affiliations::new(held.repositories())),
+            )),
             ..state
         },
     };

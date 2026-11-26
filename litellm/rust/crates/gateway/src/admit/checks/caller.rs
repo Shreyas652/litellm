@@ -9,7 +9,8 @@ use super::{Admit, Authentication, Reason, Refused, head::TEAM_HEADER};
 /// core did not authenticate is over the error's name. A JWT is checked against its scope mappings
 /// only for the model the request names, which the core is not handed before the body is read.
 /// Only the JWT path reads the team header, and Python code after auth reads it beside a key, so a
-/// key that sends one stays with Python, a key a JWT maps to included.
+/// key that sends one stays with Python, a key a JWT maps to included. A JWT whose caller belongs
+/// to a team stays with Python too, since the native spend log charges no team yet.
 pub(super) fn caller(
     admit: &Admit,
     request: &Parts,
@@ -35,7 +36,13 @@ pub(super) fn caller(
                 via: Via::MappedJwt(_),
                 ..
             } => team_header().or_else(scope_mappings),
-            Credential::Jwt { .. } => scope_mappings(),
+            Credential::Jwt { .. } => scope_mappings().or_else(|| {
+                caller
+                    .affiliation
+                    .holder
+                    .team()
+                    .map(|_| Reason::new(Refused::Credential, "team"))
+            }),
         },
         Err(error) => Some(Reason::new(
             Refused::Credential,
