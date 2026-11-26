@@ -6,14 +6,17 @@ use axum::{Json, body::Bytes, http::HeaderMap, response::Response};
 use futures_util::StreamExt;
 use litellm_cache_response::CachePolicy;
 use litellm_config::Spelled;
+use litellm_core_utils::get_llm_provider_logic::LlmProviders;
 use litellm_framer::sse;
 use litellm_host::call::CallOutput;
 use litellm_host_http::Sse;
+use litellm_inference::provider::resolve_llm_provider;
 use litellm_inference_messages::{
-    MessagesBody, MessagesCall, MessagesRoute, MessagesSettings, MessagesShaping, messages_body,
-    route::Messages,
+    MessagesBody, MessagesCall, MessagesRoute, MessagesSettings, MessagesShaping, VertexShaping,
+    messages_body, route::Messages,
 };
 use litellm_llms::anthropic::model_capabilities::messages_route_capabilities;
+use litellm_llms::vertex_ai::common_utils::supported_regions;
 use litellm_llms_types::formats::chat_completions::ChatCompletionsUsage;
 use litellm_llms_types::formats::messages::{
     MessagesOptionalParams,
@@ -250,7 +253,24 @@ fn shaping(
                     .and_then(Value::as_bool)
             },
         ),
-        ..MessagesShaping::default()
+        vertex: vertex(deployment, catalog),
+    }
+}
+
+/// The cost map's `supported_regions` of a Claude on Vertex AI deployment, which the route moves
+/// a location outside of to the first one, as Python's `VertexBase.get_vertex_region` does.
+fn vertex(deployment: &Deployment, catalog: &Catalog) -> VertexShaping {
+    let params = &deployment.params;
+    let supported = resolve_llm_provider(
+        &params.model,
+        params.custom_llm_provider.as_deref(),
+        "messages",
+    )
+    .ok()
+    .filter(|resolved| resolved.provider == LlmProviders::VertexAi)
+    .map(|resolved| supported_regions(catalog, resolved.model));
+    VertexShaping {
+        supported_regions: supported.unwrap_or_default(),
     }
 }
 
@@ -579,6 +599,29 @@ mod tests {
             (settings.drop_params, settings.drops_unsupported_params),
             (expected, expected)
         );
+    }
+
+    #[rstest]
+    #[case::vertex_claude(json!({"model": "vertex_ai/claude-opus-5-5"}), &["us-east5", "europe-west1"])]
+    #[case::provider_named_apart(
+        json!({"model": "claude-opus-5-5", "custom_llm_provider": "vertex_ai"}),
+        &["us-east5", "europe-west1"]
+    )]
+    #[case::another_provider(json!({"model": "anthropic/claude-opus-5-5"}), &[])]
+    fn a_vertex_deployment_carries_the_regions_its_model_is_served_in(
+        #[case] litellm_params: Value,
+        #[case] regions: &[&str],
+    ) {
+        let catalog = Catalog::parse(
+            br#"{"vertex_ai/claude-opus-5-5": {"litellm_provider": "vertex_ai-anthropic_models", "supported_regions": ["us-east5", "europe-west1"]}}"#,
+        )
+        .unwrap()
+        .value;
+        let deployment = deployment(litellm_params, json!({}));
+
+        let vertex = shaping(&deployment, &catalog, &MessagesSettings::default()).vertex;
+
+        assert_eq!(vertex.supported_regions, regions);
     }
 
     #[rstest]
